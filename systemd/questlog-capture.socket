@@ -1,0 +1,11 @@
+[Unit]
+Description=Packet capture bridge for the Questlog app under Proton
+
+[Socket]
+ListenStream=127.0.0.1:29741
+Accept=yes
+MaxConnections=16
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

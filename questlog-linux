@@ -1,0 +1,534 @@
+#!/bin/bash
+# questlog-linux: runs the official Questlog desktop app (Windows build, unmodified) inside
+# AION 2's Proton session, so it sees the game process and windows like it does on Windows.
+#
+# Steam > AION 2 > Properties > Launch Options:
+#     ~/.local/bin/questlog-linux %command%
+#   (use the full path, e.g. /home/<you>/.local/bin/questlog-linux %command%)
+#
+# That starts the game as usual, turns on Steam's launcher service for the game's container
+# (STEAM_COMPAT_LAUNCHER_SERVICE=proton), installs, updates or repairs Questlog in the game's
+# prefix when needed, starts it in the tray, and closes it when the game exits.
+#
+# Commands:
+#   questlog-linux show         open the Questlog window (starts it if needed; game must be running)
+#   questlog-linux stop [--now] close Questlog (waits 12 s first while the game runs, so it can save)
+#   questlog-linux status       show what is installed and running
+#   questlog-linux log          show the log
+#   questlog-linux --version    show this program's version
+#
+# Settings (environment, e.g. in the launch option: QL_AUTO_UPDATE=0 ~/.local/bin/questlog-linux %command%):
+#   QL_AUTO_UPDATE=0   do not update Questlog at game start
+#   QL_TRAY=0          keep Questlog's own tray icon instead of ours
+#   QL_WINDOW_GUARD=0  turn off the window-order guard in the capture bridge
+set -u
+
+QL_LINUX_VERSION=1.0.0
+APPID="${QL_APPID:-3393110}"
+GAME_EXE="${QL_GAME_EXE:-AION2.exe}"
+STEAM_DIR="${QL_STEAM_DIR:-$HOME/.local/share/Steam}"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/questlog-linux"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/questlog-linux"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/questlog-linux"
+LOG="$STATE_DIR/questlog-linux.log"
+BRIDGE_LOG="$STATE_DIR/bridge.log"
+CDN="${QL_CDN:-https://cdn.questlog.gg/desktop}"
+QL_EXE='C:\Program Files\Questlog\Questlog.exe'
+QL_DIR_REL='drive_c/Program Files/Questlog'
+SHIM_REL='drive_c/windows/system32/Npcap/wpcap.dll'
+SHIM_MARK='questlog-linux wpcap bridge'
+CTL="$DATA_DIR/questlog-ctl.exe"
+TRAY="$DATA_DIR/questlog-tray.py"
+ICON="$DATA_DIR/questlog.png"
+SAVE_WAIT=12        # Questlog writes fights and settings at most 10 s after they change
+UPDATE_TRIAL=60     # an updated Questlog that ends sooner than this after its start is rolled back
+SELF=$(readlink -f "$0")
+
+mkdir -p "$STATE_DIR" "$CACHE_DIR"
+
+# Only the game itself needs Steam's library path and overlay; for everything else they break host tools.
+case "${1:-}" in
+    _*|show|start|stop|status|log) unset LD_LIBRARY_PATH LD_PRELOAD ;;
+esac
+
+log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+    [ -t 2 ] && printf '%s\n' "$*" >&2
+    return 0
+}
+
+die() { log "error: $*"; exit 1; }
+
+notify() {
+    command -v notify-send >/dev/null || return 0
+    notify-send -a Questlog -i "$( [ -f "$ICON" ] && echo "$ICON" || echo applications-games )" "Questlog" "$1" \
+        >/dev/null 2>&1 < /dev/null &
+}
+
+winpath() { printf 'Z:%s' "$1" | tr '/' '\\'; }
+
+# ---- where things are ----------------------------------------------------------------------
+
+library_dirs() {
+    local vdf="$STEAM_DIR/steamapps/libraryfolders.vdf"
+    echo "$STEAM_DIR"
+    [ -f "$vdf" ] && sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$vdf"
+}
+
+compat_dir() {
+    # Steam sets STEAM_COMPAT_DATA_PATH for the launch option; otherwise look in every library.
+    local env_dir="${STEAM_COMPAT_DATA_PATH:-}" lib
+    env_dir="${env_dir%/}"
+    if [ -n "$env_dir" ] && [ "${env_dir##*/}" = "$APPID" ] && [ -d "$env_dir/pfx" ]; then
+        echo "$env_dir"
+        return
+    fi
+    while IFS= read -r lib; do
+        [ -d "$lib/steamapps/compatdata/$APPID/pfx" ] && { echo "$lib/steamapps/compatdata/$APPID"; return; }
+    done < <(library_dirs | awk '!seen[$0]++')
+    return 1
+}
+
+launch_client() {
+    local lib c
+    while IFS= read -r lib; do
+        for c in "$lib"/steamapps/common/SteamLinuxRuntime_*/pressure-vessel/bin/steam-runtime-launch-client; do
+            [ -x "$c" ] && { echo "$c"; return; }
+        done
+    done < <(library_dirs | awk '!seen[$0]++')
+    return 1
+}
+
+# Runs a shell snippet inside the game's container, in Proton's environment, with $WINE set.
+# Questlog and its children get powershell.exe disabled: Wine's stub answers "yes" to every
+# script, which breaks the installer's "is the app running?" check and the updater's signature
+# check (with PowerShell missing, both fall back to paths that work).
+inside() {
+    local client
+    client=$(launch_client) || die "steam-runtime-launch-client not found (is a Steam Linux Runtime installed?)"
+    (cd "$HOME" && "$client" --inside-app="$APPID" -- /bin/sh -c '
+        # Proton puts its files/bin first in PATH for this service; the tool paths are a fallback.
+        WINE=$(command -v wine 2>/dev/null)
+        if [ -z "$WINE" ]; then
+            IFS=:
+            for v in ${STEAM_COMPAT_TOOL_PATHS:-}; do
+                [ -z "$WINE" ] && [ -x "$v/files/bin/wine" ] && WINE="$v/files/bin/wine"
+            done
+            unset IFS
+        fi
+        [ -n "$WINE" ] || { echo "wine not found in the game container" >&2; exit 127; }
+        export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}powershell.exe=d"
+        export WINEDEBUG=-all
+        export QL_BRIDGE_LOG="$1" QL_WINDOW_GUARD="$2"
+        unset WINELOADERNOEXEC
+        eval "$0"
+    ' "$1" "$(winpath "$BRIDGE_LOG")" "${QL_WINDOW_GUARD:-1}")
+}
+
+service_up() {
+    local client
+    client=$(launch_client) || return 1
+    (cd "$HOME" && timeout 10 "$client" --inside-app="$APPID" -- /bin/true) >/dev/null 2>&1
+}
+
+# Runs questlog-ctl.exe (Questlog's tray icon and window) inside the game's session.
+ctl() {
+    [ -f "$CTL" ] || { log "questlog-ctl.exe is missing; run install.sh again"; return 1; }
+    inside "\"\$WINE\" '$(winpath "$CTL")' $*"
+}
+
+# Prints a file from an Electron .asar archive (only reads it; nothing in it is run).
+asar_cat() {
+    python3 -I -c '
+import json, struct, sys
+with open(sys.argv[1], "rb") as f:
+    head = f.read(16)
+    node = json.loads(f.read(struct.unpack_from("<I", head, 12)[0]))
+    for part in sys.argv[2].split("/"):
+        node = node["files"][part]
+    f.seek(8 + struct.unpack_from("<I", head, 4)[0] + int(node["offset"]))
+    sys.stdout.buffer.write(f.read(int(node["size"])))
+' "$1" "$2" 2>/dev/null
+}
+
+# ---- processes ---------------------------------------------------------------------------------
+
+# Prints pids whose argv[0] basename matches $1 (case-insensitive); with $2, only in that prefix.
+pids_named() {
+    local want="${1,,}" prefix="${2:-}" f pid a0 base
+    for f in /proc/[0-9]*/cmdline; do
+        { IFS= read -r -d '' a0 < "$f"; } 2>/dev/null || continue
+        base=${a0##*[/\\]}
+        [ "${base,,}" = "$want" ] || continue
+        pid=${f#/proc/}; pid=${pid%/cmdline}
+        if [ -n "$prefix" ]; then
+            tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | grep -qxF -e "WINEPREFIX=$prefix" -e "WINEPREFIX=$prefix/" || continue
+        fi
+        echo "$pid"
+    done
+}
+
+game_running() { [ -n "$(pids_named "$GAME_EXE")" ]; }
+
+questlog_pids() {
+    local pfx="$1/pfx"
+    { pids_named Questlog.exe "$pfx"; pids_named questlog-launcher.exe "$pfx"; } | sort -u
+}
+
+# ---- install / update / repair -----------------------------------------------------------------
+
+ensure_shim() {
+    local pfx="$1/pfx" src="$DATA_DIR/wpcap.dll" dst
+    dst="$pfx/$SHIM_REL"
+    [ -f "$src" ] || die "$src is missing; run install.sh again"
+    cmp -s "$src" "$dst" && return 0
+    if [ -e "$dst" ] && ! grep -aqF "$SHIM_MARK" "$dst"; then
+        log "error: $dst is not questlog-linux's capture bridge (a real Npcap?); leaving it alone." \
+            "Npcap is a Windows driver and cannot work under Wine: delete the folder" \
+            "drive_c/windows/system32/Npcap in the game prefix, then start the game again."
+        notify "The game prefix has a different wpcap.dll (Npcap?). Questlog cannot capture until it is removed: see questlog-linux log."
+        return 1
+    fi
+    mkdir -p "$(dirname "$dst")"
+    # A new file, then a rename: a running Questlog keeps the copy it has mapped.
+    cp -f "$src" "$dst.new" && mv -f "$dst.new" "$dst" && log "installed the capture bridge (wpcap.dll) in the game prefix"
+}
+
+installed_version() {
+    asar_cat "$1/pfx/$QL_DIR_REL/resources/app.asar" package.json \
+        | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null
+}
+
+# newer A B: true if version A is newer than version B.
+newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+feed() {
+    curl -fsSL -m 30 "$CDN/latest.yml" || { log "could not read $CDN/latest.yml"; return 1; }
+}
+
+feed_value() { sed -n "s/^$1:[[:space:]]*//p" | head -1 | tr -d "'\""; }
+
+# Prints the path of the verified installer described by latest.yml ($1 = compat dir, $2 = feed).
+# Questlog's own updater may have downloaded it already while the game ran; that copy is reused.
+download_installer() {
+    local compat="$1" yml="$2" path sha file got pending cache_name
+    path=$(printf '%s\n' "$yml" | feed_value path)
+    sha=$(printf '%s\n' "$yml" | feed_value sha512)
+    case "$path" in questlog-setup-*.exe) ;; *) log "unexpected installer name in latest.yml: $path"; return 1 ;; esac
+    file="$CACHE_DIR/$path"
+    if [ ! -f "$file" ]; then
+        cache_name=$(sed -n "s/^updaterCacheDirName:[[:space:]]*//p" "$compat/pfx/$QL_DIR_REL/resources/app-update.yml" 2>/dev/null | tr -d "'\"")
+        pending="$compat/pfx/drive_c/users/steamuser/AppData/Local/${cache_name:-@questlogdesktop-app-updater}/pending/$path"
+        if [ -f "$pending" ] && [ "$(openssl dgst -sha512 -binary "$pending" | base64 -w0)" = "$sha" ]; then
+            cp -f "$pending" "$file.part" && mv "$file.part" "$file" && log "using the installer Questlog's updater already downloaded ($path)"
+        fi
+    fi
+    if [ ! -f "$file" ]; then
+        log "downloading $path"
+        curl -fsSL -m 900 -o "$file.part" "$CDN/$path" || { rm -f "$file.part"; log "download failed"; return 1; }
+        mv "$file.part" "$file"
+    fi
+    got=$(openssl dgst -sha512 -binary "$file" | base64 -w0)
+    if [ "$got" != "$sha" ]; then
+        rm -f "$file"
+        log "the installer's sha512 does not match latest.yml; deleted it"
+        return 1
+    fi
+    echo "$file"
+}
+
+# Checks, before installing, that a Questlog version still works with the capture bridge:
+# it must load Npcap's wpcap.dll and call only functions the bridge has. Prints the problem.
+check_compat() {
+    local file="$1" tmp names have missing="" n
+    if ! command -v 7z >/dev/null; then
+        log "7z is not installed; skipping the compatibility check of $(basename "$file")"
+        return 0
+    fi
+    tmp=$(mktemp -d "$CACHE_DIR/check.XXXXXX") || return 0
+    7z e -y -o"$tmp" "$file" '$PLUGINSDIR/app-64.7z' >/dev/null 2>&1 \
+        && 7z e -y -o"$tmp" "$tmp/app-64.7z" resources/app.asar >/dev/null 2>&1
+    if [ ! -f "$tmp/app.asar" ]; then
+        rm -rf "$tmp"
+        echo "its installer could not be unpacked for the compatibility check"
+        return 1
+    fi
+    names=$(grep -aoE 'func\("[^"(]*pcap_[a-z_]+\(' "$tmp/app.asar" | grep -oE 'pcap_[a-z_]+\($' | tr -d '(' | sort -u)
+    grep -aqF 'wpcap.dll' "$tmp/app.asar" && grep -aqF 'Npcap' "$tmp/app.asar" || missing="no Npcap wpcap.dll"
+    rm -rf "$tmp"
+    [ -n "$missing" ] && { echo "it no longer loads Npcap's wpcap.dll"; return 1; }
+    [ -n "$names" ] || { echo "its capture calls could not be found (the app changed how it uses Npcap)"; return 1; }
+    have=$(grep -aoE 'pcap_[a-z_]+' "$DATA_DIR/wpcap.dll" | sort -u)
+    for n in $names; do
+        printf '%s\n' "$have" | grep -qxF "$n" || missing="$missing $n"
+    done
+    [ -z "$missing" ] || { echo "it calls capture functions the bridge does not have:$missing"; return 1; }
+}
+
+run_installer() {
+    local compat="$1" file="$2"
+    inside "\"\$WINE\" '$(winpath "$file")' /S --updated" >> "$LOG" 2>&1
+    [ -f "$compat/pfx/$QL_DIR_REL/Questlog.exe" ]
+}
+
+ensure_installed() {
+    local compat="$1" yml file
+    [ -f "$compat/pfx/$QL_DIR_REL/Questlog.exe" ] && return 0
+    yml=$(feed) || return 1
+    file=$(download_installer "$compat" "$yml") || return 1
+    log "installing Questlog in the game prefix"
+    inside "\"\$WINE\" '$(winpath "$file")' /S" >> "$LOG" 2>&1
+    [ -f "$compat/pfx/$QL_DIR_REL/Questlog.exe" ] || { log "the Questlog installer did not finish"; return 1; }
+    log "Questlog $(installed_version "$compat") installed"
+}
+
+# Questlog's own updater cannot finish under questlog-linux (it installs when the app quits, and
+# Questlog is ended from outside), so a newer version is installed here, before Questlog starts.
+update_questlog() {
+    local compat="$1" have want yml file problem keep
+    [ "${QL_AUTO_UPDATE:-1}" = 0 ] && return 0
+    [ -n "$(questlog_pids "$compat")" ] && return 0
+    have=$(installed_version "$compat")
+    [ -n "$have" ] || return 0
+    yml=$(feed) || return 0
+    want=$(printf '%s\n' "$yml" | feed_value version)
+    [ -n "$want" ] && newer "$want" "$have" || return 0
+    if grep -qxF "$want" "$STATE_DIR/skip-versions" 2>/dev/null; then return 0; fi
+    log "Questlog $want is available (installed: $have)"
+    file=$(download_installer "$compat" "$yml") || return 0
+    if ! problem=$(check_compat "$file"); then
+        log "not installing Questlog $want: $problem; staying on $have"
+        echo "$want" >> "$STATE_DIR/skip-versions"
+        notify "Questlog $want does not work with questlog-linux yet ($problem). Staying on $have."
+        return 0
+    fi
+    log "updating Questlog $have -> $want"
+    if ! run_installer "$compat" "$file" || [ "$(installed_version "$compat")" != "$want" ]; then
+        log "the update to $want did not finish (installed now: $(installed_version "$compat"))"
+        return 0
+    fi
+    log "Questlog updated to $want"
+    printf '%s %s %s\n' "$want" "$have" "$(date +%s)" > "$STATE_DIR/just-updated"
+    notify "Questlog updated to $want."
+    # keep the installers of this and the previous version (the previous one is the way back)
+    for keep in "$CACHE_DIR"/questlog-setup-*.exe; do
+        case "${keep##*/}" in "questlog-setup-$want.exe"|"questlog-setup-$have.exe") ;; *) rm -f "$keep" ;; esac
+    done
+}
+
+# Called while Questlog runs after an update: if it ended within UPDATE_TRIAL seconds, the
+# previous version goes back (when its installer is still cached) and is started again.
+check_update_trial() {
+    local compat="$1" want have at file
+    [ -f "$STATE_DIR/just-updated" ] || return 0
+    read -r want have at < "$STATE_DIR/just-updated"
+    [ $(( $(date +%s) - at )) -ge "$UPDATE_TRIAL" ] && { rm -f "$STATE_DIR/just-updated"; return 0; }
+    [ -n "$(questlog_pids "$compat")" ] && return 0
+    rm -f "$STATE_DIR/just-updated"
+    echo "$want" >> "$STATE_DIR/skip-versions"
+    file="$CACHE_DIR/questlog-setup-$have.exe"
+    if [ ! -f "$file" ]; then
+        log "Questlog $want ended right after starting, and the installer of $have is not cached to go back"
+        notify "Questlog $want closed right after starting. See questlog-linux log."
+        return 0
+    fi
+    log "Questlog $want ended right after starting; going back to $have"
+    if run_installer "$compat" "$file" && [ "$(installed_version "$compat")" = "$have" ]; then
+        notify "Questlog $want did not start under Proton; went back to $have."
+        start_questlog "$compat" --hidden
+    else
+        log "going back to $have did not finish"
+    fi
+}
+
+# Questlog's icon, taken from its installation, for our tray icon, notifications and menu entry.
+ensure_icon() {
+    local entry="${XDG_DATA_HOME:-$HOME/.local/share}/applications/questlog-linux.desktop"
+    if [ ! -s "$ICON" ]; then
+        asar_cat "$1/pfx/$QL_DIR_REL/resources/app.asar" resources/icon.png > "$ICON.new" && [ -s "$ICON.new" ] \
+            && mv -f "$ICON.new" "$ICON" || { rm -f "$ICON.new"; return 0; }
+    fi
+    [ -f "$entry" ] && grep -qx 'Icon=applications-games' "$entry" && sed -i "s|^Icon=applications-games\$|Icon=$ICON|" "$entry"
+    return 0
+}
+
+# ---- run ------------------------------------------------------------------------------------------
+
+# Wine settings for Questlog.exe only (the game's windows are not affected):
+#  Decorated=N     Questlog draws its own title bar (frameless window); otherwise the window
+#                  manager adds one on top and the app's header is cut off.
+#  UseTakeFocus=N  with WM_TAKE_FOCUS, KWin (Wayland session) hands focus over with an X timestamp
+#                  that can be seconds old; the game keeps refreshing its own focus, so the X server
+#                  drops Questlog's request and Alt+Tab from the game to Questlog does nothing.
+#                  Without it, the window manager sets the focus itself.
+ensure_settings() {
+    local key='HKCU\Software\Wine\AppDefaults\Questlog.exe\X11 Driver'
+    grep -qs '"UseTakeFocus"="N"' "$1/pfx/user.reg" && grep -qs '"Decorated"="N"' "$1/pfx/user.reg" && return 0
+    inside "\"\$WINE\" reg add '$key' /v Decorated /t REG_SZ /d N /f && \"\$WINE\" reg add '$key' /v UseTakeFocus /t REG_SZ /d N /f" >> "$LOG" 2>&1 \
+        && log "applied Questlog.exe window settings (Decorated=N, UseTakeFocus=N)"
+}
+
+start_questlog() {
+    local compat="$1"; shift
+    if [ -n "$(questlog_pids "$compat")" ]; then
+        # Already running: starting it again only makes the running copy show its window.
+        "$SELF" _inside "\"\$WINE\" '$QL_EXE' $*" < /dev/null > /dev/null 2>&1 8>&- &
+        return 0
+    fi
+    ensure_shim "$compat"
+    ensure_installed "$compat" || return 1
+    update_questlog "$compat"
+    ensure_settings "$compat"
+    ensure_icon "$compat"
+    log "starting Questlog $*"
+    # steam-runtime-launch-client stays attached until Questlog exits, so run it in the background.
+    # Chromium under Wine prints a harmless network-notifier error every second; keep it out.
+    # fd 8 (the watcher's lock) is not passed on.
+    nohup "$SELF" _inside "\"\$WINE\" '$QL_EXE' $*" < /dev/null 8>&- 2>&1 \
+        | grep --line-buffered -v -e 'network_change_notifier_win' -e '^info:' -e '^warn:' > "$STATE_DIR/questlog-app.log" 8>&- &
+}
+
+# Our tray icon (see tray/questlog-tray.py). It runs in the desktop session's environment
+# (systemd --user), not in Steam's, and ends by itself when Questlog ends.
+start_tray() {
+    local compat="$1"
+    [ "${QL_TRAY:-1}" = 0 ] && return 0
+    [ -f "$TRAY" ] || return 0
+    if ! /usr/bin/python3 -c 'import PySide6' 2>/dev/null; then
+        log "PySide6 is not installed, so Questlog keeps its own tray icon (its menu may open only once under Wine)"
+        return 0
+    fi
+    systemctl --user is-active --quiet questlog-linux-tray.service 2>/dev/null && return 0
+    local v setenv=()
+    for v in QL_APPID QL_GAME_EXE QL_STEAM_DIR QL_CDN QL_AUTO_UPDATE QL_TRAY QL_WINDOW_GUARD; do
+        [ -n "${!v+x}" ] && setenv+=("--setenv=$v=${!v}")
+    done
+    systemd-run --user --quiet --collect --unit=questlog-linux-tray "${setenv[@]}" \
+        /usr/bin/python3 "$TRAY" "$SELF" "$compat/pfx" 2>/dev/null \
+        || setsid -f /usr/bin/python3 "$TRAY" "$SELF" "$compat/pfx" < /dev/null >> "$LOG" 2>&1 8>&-
+}
+
+# Wine does not let Questlog take the focus from another program, so ask the window manager.
+activate_window() {
+    local compat="$1" i pid w
+    command -v xdotool >/dev/null && [ -n "${DISPLAY:-}" ] || return 0
+    for i in $(seq 1 20); do
+        for pid in $(pids_named Questlog.exe "$compat/pfx"); do
+            w=$(xdotool search --onlyvisible --pid "$pid" --name '^Questlog$' 2>/dev/null | head -1)
+            [ -n "$w" ] && { xdotool windowactivate "$w" 2>/dev/null; return 0; }
+        done
+        sleep 0.5
+    done
+}
+
+stop_questlog() {
+    local compat="$1" wait="${2:-0}" pids i
+    pids=$(questlog_pids "$compat")
+    [ -z "$pids" ] && return 0
+    rm -f "$STATE_DIR/just-updated"
+    if [ "$wait" -gt 0 ]; then
+        # Questlog writes fights and settings at most 10 s after they change, and is ended from
+        # outside without its own quit step, so give it that time (its window goes away first).
+        log "closing Questlog in ${wait}s, after it has saved"
+        ctl hide-window >> "$LOG" 2>&1
+        sleep "$wait"
+        pids=$(questlog_pids "$compat")
+        [ -z "$pids" ] && return 0
+    fi
+    log "closing Questlog"
+    kill -TERM $pids 2>/dev/null
+    for i in $(seq 1 10); do
+        sleep 0.5
+        pids=$(questlog_pids "$compat")
+        [ -z "$pids" ] && return 0
+    done
+    kill -KILL $pids 2>/dev/null
+}
+
+watch_game() {
+    local compat i gone=0
+    [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 2000000 ] && : > "$LOG"
+    exec >> "$LOG" 2>&1 < /dev/null
+    # One watcher at a time (a second game launch while one still runs leaves it alone).
+    exec 8> "$STATE_DIR/watch.lock"
+    flock -n 8 || { log "another questlog-linux watcher is running; this one leaves"; exit 0; }
+    compat=$(compat_dir) || die "the game's Proton prefix was not found"
+    log "game launched (app $APPID); waiting for its container"
+    for i in $(seq 1 120); do service_up && break; sleep 2; done
+    service_up || die "the game's launcher service did not appear (Proton too old, or not a Proton launch?)"
+    if start_questlog "$compat" --hidden; then start_tray "$compat"; else log "Questlog was not started"; fi
+    for i in $(seq 1 150); do game_running && break; sleep 2; done
+    while :; do
+        sleep 5
+        check_update_trial "$compat"
+        if game_running; then gone=0; else gone=$((gone + 1)); fi
+        [ "$gone" -ge 3 ] && break
+    done
+    log "game closed"
+    # The game has been gone for 15 s, so Questlog has saved everything: no extra wait.
+    stop_questlog "$compat"
+}
+
+status() {
+    local compat client latest
+    echo "game app id:          $APPID"
+    if compat=$(compat_dir); then echo "game prefix:          $compat/pfx"; else echo "game prefix:          not found"; fi
+    if [ -n "${compat:-}" ] && [ -f "$compat/pfx/$QL_DIR_REL/Questlog.exe" ]; then
+        echo "Questlog installed:   yes ($(installed_version "$compat"))"
+    else
+        echo "Questlog installed:   no (it is installed on the first game launch)"
+    fi
+    latest=$(curl -fsSL -m 10 "$CDN/latest.yml" 2>/dev/null | feed_value version)
+    echo "Questlog latest:      ${latest:-unknown}$( [ "${QL_AUTO_UPDATE:-1}" = 0 ] && echo ' (automatic updates off)')"
+    if [ -n "${compat:-}" ] && cmp -s "$DATA_DIR/wpcap.dll" "$compat/pfx/$SHIM_REL"; then
+        echo "capture bridge DLL:   installed"
+    else
+        echo "capture bridge DLL:   not in the prefix yet (copied on the next start)"
+    fi
+    echo "capture service:      $(systemctl is-active questlog-capture.socket 2>/dev/null) (questlog-capture.socket)"
+    if client=$(launch_client); then echo "launch client:        $client"; else echo "launch client:        not found"; fi
+    if game_running; then echo "game running:         yes"; else echo "game running:         no"; fi
+    if service_up; then echo "game container:       reachable"; else echo "game container:       not reachable (start the game with the launch option)"; fi
+    if [ -n "${compat:-}" ] && [ -n "$(questlog_pids "$compat")" ]; then echo "Questlog running:     yes"; else echo "Questlog running:     no"; fi
+    echo "tray icon:            $(systemctl --user is-active questlog-linux-tray.service 2>/dev/null)"
+}
+
+case "${1:-}" in
+    _watch)
+        watch_game ;;
+    _inside)
+        shift; inside "$1" ;;
+    _ctl)
+        shift; ctl "$@" ;;
+    _icon)
+        compat=$(compat_dir) && ensure_icon "$compat" ;;
+    show|start)
+        compat=$(compat_dir) || die "the game's Proton prefix was not found"
+        if ! service_up; then
+            msg="Questlog runs inside AION 2's session. Start the game from Steam first (launch option: questlog-linux %command%)."
+            [ ! -t 2 ] && notify "$msg"
+            die "$msg"
+        fi
+        start_questlog "$compat" || exit 1
+        start_tray "$compat"
+        [ "$1" = show ] && activate_window "$compat" ;;
+    stop)
+        compat=$(compat_dir) || die "the game's Proton prefix was not found"
+        if [ "${2:-}" != --now ] && game_running; then stop_questlog "$compat" "$SAVE_WAIT"; else stop_questlog "$compat"; fi ;;
+    status)
+        status ;;
+    log)
+        tail -n 60 "$LOG"
+        [ -s "$BRIDGE_LOG" ] && { echo "--- capture bridge (inside Questlog):"; tail -n 20 "$BRIDGE_LOG"; } ;;
+    --version|version)
+        echo "questlog-linux $QL_LINUX_VERSION" ;;
+    ""|-h|--help|help)
+        sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)
+        # Steam launch option mode: everything after us is the game's command line.
+        export STEAM_COMPAT_LAUNCHER_SERVICE=proton
+        # The watcher runs host tools (curl, openssl): drop Steam's runtime libraries and overlay
+        # preload, which Steam puts in the game's environment and which break host programs.
+        env -u LD_LIBRARY_PATH -u LD_PRELOAD setsid -f "$0" _watch < /dev/null >> "$LOG" 2>&1
+        exec "$@" ;;
+esac

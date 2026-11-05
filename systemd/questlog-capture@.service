@@ -1,0 +1,38 @@
+[Unit]
+Description=Packet capture bridge for the Questlog app under Proton (one connection)
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/local/libexec/questlog-capture
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=@USER@
+Environment=QL_CAPTURE_PROCESSES=AION2.exe
+
+# Raw sockets only, and only for this process.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+
+# Everything else is locked down. /proc stays visible: the service reads the game's sockets there.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_PACKET AF_NETLINK AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+RuntimeMaxSec=1d
