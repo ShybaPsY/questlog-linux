@@ -1,6 +1,6 @@
 # questlog-linux
 
-Runs the official [Questlog](https://questlog.gg) desktop app for AION 2 on Linux, inside the game's own Steam Proton session: live combat meter, overlays and hotkeys. Questlog itself is not modified; it is installed with its official installer and runs as it does on Windows.
+Runs the official [Questlog](https://questlog.gg) desktop app for AION 2 on Linux, inside the game's own Steam Proton session: live combat meter, overlays and hotkeys. Questlog's files are not modified; it is installed with its official installer and runs as it does on Windows.
 
 Made with the Questlog team's knowledge. Not an official Questlog product, and it contains no Questlog code.
 
@@ -41,6 +41,7 @@ Made with the Questlog team's knowledge. Not an official Questlog product, and i
 - Npcap cannot run under Wine. A stand-in `wpcap.dll` implements the libpcap calls Questlog makes and forwards them to `questlog-capture`, a small Linux service that captures only the game's own TCP connections.
 - The launcher runs Questlog inside the game's Wine session through Steam's launcher service, so Questlog sees the game process, its connections and its window as on Windows.
 - It also works around what comes with sharing a Wine session with a fullscreen game: window focus, the overlay layer under KDE, the tray menu, clicks reaching Questlog, updates and quitting.
+- Questlog's interface fonts are variable fonts, and Wine's DirectWrite ignores their weights (every weight rendered alike, Encode Sans all Thin). A small `dwrite.dll` stand-in, loaded by Questlog only, makes Chromium render them with its own FreeType, at the right weights.
 
 [Questlog-on-Linux.pdf](Questlog-on-Linux.pdf) explains each part, every problem found under Wine/Proton and why each fix was chosen, plus security, measurements and known limits.
 

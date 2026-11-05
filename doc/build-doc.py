@@ -10,11 +10,13 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer,
+from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer,
                                 Table, TableStyle)
+import os
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 OUT = sys.argv[1]
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 F = "/usr/share/fonts/liberation-sans-fonts/LiberationSans-"
 M = "/usr/share/fonts/liberation-mono-fonts/LiberationMono-"
@@ -157,14 +159,16 @@ story += [P("1. Summary", h1)]
 story += [P("Questlog Desktop is a Windows-only Electron app. This package makes the <b>official, unmodified</b> Windows "
             "build run on Linux inside AION 2's own Proton session, with the live combat meter, overlays and hotkeys. "
             "Questlog is installed with its official installer from " + c("cdn.questlog.gg") + " and none of its files "
-            "are changed. What this package adds around it:")]
+            "are changed (one file is added to its folder: the font fix, 4.12). What this package adds around it:")]
 story += B(["a replacement for Npcap's " + c("wpcap.dll") + " that hands Questlog packets captured on the Linux side;",
             "a small Linux capture service that captures only the game's own TCP connections;",
             "a launcher, set as the game's Steam launch option, that starts Questlog inside the game's Wine session, "
             "keeps it installed and up to date, and closes it after the game;",
-            "fixes for the window, focus and tray problems that come with sharing a Wine session with a fullscreen game."])
+            "fixes for the window, focus and tray problems that come with sharing a Wine session with a fullscreen game;",
+            "a DirectWrite stand-in for Questlog only, so its variable fonts render at their real weights."])
 story += [P("<b>Status.</b> In daily play on the tested system: live capture and DPS meter, character detection, recordings, "
-            "the overlays and their Alt+E controls, Alt+Tab between the game and Questlog, Questlog's own title bar. "
+            "the overlays and their Alt+E controls, Alt+Tab between the game and Questlog, Questlog's own title bar, "
+            "and the interface fonts at their real weights (since 1.1.0). "
             "Section 7 lists what is not tested yet. The Questlog team knows about this work.")]
 
 story += [P("2. Install and use", h1)]
@@ -197,7 +201,8 @@ story += [P("Settings are environment variables, written before the command in t
 story += [table([["Variable", "Effect"],
                  [c("QL_AUTO_UPDATE=0"), "do not update Questlog at game start"],
                  [c("QL_TRAY=0"), "keep Questlog's own tray icon instead of ours"],
-                 [c("QL_WINDOW_GUARD=0"), "turn off the window-order guard in the bridge (4.7)"]],
+                 [c("QL_WINDOW_GUARD=0"), "turn off the window-order guard in the bridge (4.7)"],
+                 [c("QL_FONT_FIX=0"), "take the font fix out again (4.12)"]],
                 [52 * mm, 118 * mm]), Spacer(1, 6)]
 story += [P("What gets installed", h2)]
 story += [table([["Where", "What"],
@@ -205,13 +210,15 @@ story += [table([["Where", "What"],
                  [c("/etc/systemd/system/questlog-capture.socket") + "<br/>" + c("questlog-capture@.service"),
                   "socket-activated service, runs as the user who installed it"],
                  [c("~/.local/bin/questlog-linux"), "the launcher"],
-                 [c("~/.local/share/questlog-linux/"), c("wpcap.dll") + ", " + c("questlog-ctl.exe") + ", "
+                 [c("~/.local/share/questlog-linux/"), c("wpcap.dll") + ", " + c("questlog-ctl.exe") + ", " + c("dwrite.dll") + ", "
                   + c("questlog-tray.py") + ", Questlog's icon (taken from the user's installation)"],
                  [c("~/.local/share/applications/questlog-linux.desktop"), "menu entry “Questlog (AION 2)”"],
                  [c("~/.config/kwinrulesrc"), "one window rule, " + c("questlog-hud") + " (KDE only; other rules untouched)"],
                  ["game prefix (" + c("compatdata/3393110/pfx") + ")",
                   c("C:\\Program Files\\Questlog") + " (official installer), " + c("C:\\windows\\system32\\Npcap\\wpcap.dll")
-                  + " (the bridge), two values under " + c("HKCU\\Software\\Wine\\AppDefaults\\Questlog.exe\\X11 Driver")],
+                  + " (the bridge), " + c("C:\\Program Files\\Questlog\\dwrite.dll") + " (the font fix), under "
+                  + c("HKCU\\Software\\Wine\\AppDefaults\\Questlog.exe") + ": two " + c("X11 Driver") + " values and "
+                  + c("DllOverrides: dwrite=native,builtin")],
                  [c("~/.local/state/questlog-linux/"), "logs: launcher, Questlog's output, bridge"],
                  [c("~/.cache/questlog-linux/"), "the installers of the current and previous Questlog version"]],
                 [72 * mm, 98 * mm])]
@@ -227,6 +234,8 @@ story += [table([["Part", "Runs", "Role"],
                   "lists adapters, opens a capture, accepts only filters for the game's ports, streams packets"],
                  [c("questlog-ctl.exe") + " (C, MinGW)", "inside the game's session, on demand",
                   "hides or shows Questlog's own tray icon; hides its window before it is ended"],
+                 [c("dwrite.dll") + " (C, MinGW)", "inside Questlog's processes (per-program DLL override)",
+                  "forwards to Wine's DirectWrite; hides its variation interface so Chromium renders variable fonts with its own FreeType"],
                  [c("questlog-tray.py") + " (PySide6)", "Linux, " + c("systemd-run --user"), "tray icon with Open and Quit"],
                  [c("install.sh"), "Linux", "install, update, uninstall"]],
                 [38 * mm, 42 * mm, 90 * mm]), Spacer(1, 6)]
@@ -343,6 +352,28 @@ story += [problem("4.11 Smaller things",
                   "Both variables are removed for everything but the game. That one log line is filtered out. The service "
                   "captures the ports that are still the game's and logs the others (it refuses only when none is).")]
 
+story += [problem("4.12 The interface fonts looked wrong",
+                  "Text in the window and the overlays looked thin and odd; the Questlog team noticed it on a screenshot.",
+                  "Questlog's fonts are variable fonts: Encode Sans (the file is Encode Sans Condensed, axis wght 100-900, "
+                  "default instance Thin) and Noto Sans (wght 100-900). Chromium on Windows renders a variable web font through "
+                  "DirectWrite when its font faces offer " + c("IDWriteFontFace5") + ", and with its own FreeType otherwise. "
+                  "Wine's DirectWrite offers the interface but does not apply axis values when rendering (Proton 11: "
+                  + c("GetFontAxisValues") + " is a stub, and its FreeType rasterizer never sets variation coordinates). "
+                  "So every weight came out as one instance: all Encode Sans text Thin, all Noto Sans text one weight.",
+                  "A " + c("dwrite.dll") + " stand-in, loaded by " + c("Questlog.exe") + " only (per-program DLL override "
+                  + c("dwrite=native,builtin") + " and a copy in Questlog's folder). It forwards " + c("DWriteCreateFactory")
+                  + " to Wine's DirectWrite and makes font faces answer “no” to " + c("IDWriteFontFace5/6/7")
+                  + ". Chromium then renders the variable fonts with FreeType, which applies the weights, as it does on older "
+                  "Windows. Everything else is Wine's DirectWrite. The game is not affected. Off with " + c("QL_FONT_FIX=0") + ".",
+                  ("Tested", "Same sample rendered by the real Questlog under Proton, without and with the stand-in (below); "
+                   + c("tests/fontfix-test.c") + " checks the interfaces."))]
+story += [KeepTogether([table([["Before: every weight alike", "After: 100 to 900, as designed"],
+                               [Image(os.path.join(HERE, "fonts-before.png"), width=82 * mm, height=82 * mm * 262 / 560),
+                                Image(os.path.join(HERE, "fonts-after.png"), width=82 * mm, height=82 * mm * 262 / 560)]],
+                              [85 * mm, 85 * mm]),
+                        P("Encode Sans at weights 100, 300, 400, 500, 600, 700, 900, Noto Sans at 400, 600, 700, and Encode Sans "
+                          "400 and 700 at 20 px, captured from Questlog 0.1.48 through its DevTools protocol.", small)])]
+
 story += [P("5. Security and privacy", h1)]
 story += B(["Capture runs on the Linux side, as the user, with one capability (" + c("CAP_NET_RAW") + ") granted by systemd, plus "
             + c("NoNewPrivileges") + ", " + c("ProtectSystem=strict") + ", " + c("ProtectHome") + ", " + c("PrivateTmp")
@@ -353,8 +384,8 @@ story += B(["Capture runs on the Linux side, as the user, with one capability ("
             "of a TCP socket owned by a process whose program is " + c("AION2.exe") + ". The filter is rebuilt from the checked "
             "ports, never passed through, and checked again every 5 s (capture pauses while the ports are not the game's). "
             "Promiscuous mode is never used.",
-            "No traffic is written to disk or sent anywhere. Questlog's files are not modified; the only changes in the "
-            "prefix are the bridge DLL and two per-program Wine values."])
+            "No traffic is written to disk or sent anywhere. Questlog's files are not modified; the prefix gets the bridge DLL, "
+            "the font fix in Questlog's folder and three per-program Wine values (all for " + c("Questlog.exe") + " only)."])
 
 story += [P("6. Measurements", h1)]
 story += [P("Delay from capture to Questlog processing, taken from Questlog's own encounter index: for fights that end in "
@@ -364,9 +395,7 @@ story += [table([["Mean", "Median", "Max", "First 32 kills", "Last 32 kills"],
           Spacer(1, 4), P("No drift over the session.", small)]
 
 story += [P("7. Known limitations and not tested yet", h1)]
-story += B(["<b>Overlay text looks different.</b> Same bundled fonts (Encode Sans, Noto Sans), but Wine rasterizes them into "
-            "the transparent layered windows differently from Windows. Not addressed yet.",
-            "<b>Tested on one system</b> (see the first page). The KWin rule exists only for KDE Plasma; on other desktops the "
+story += B(["<b>Tested on one system</b> (see the first page). The KWin rule exists only for KDE Plasma; on other desktops the "
             "overlay controls may stay under a fullscreen game (borderless window mode may help, untested).",
             "<b>Not tested yet:</b> Discord sign-in inside Questlog; an update to a real new release; other games than AION 2 "
             "(" + c("QL_APPID") + " and " + c("QL_GAME_EXE") + " exist but are untested).",
@@ -384,18 +413,23 @@ story += [P("8.3 An overridable Npcap folder (optional)", label),
           P("For example an environment variable read before " + c("%SystemRoot%\\System32\\Npcap") + ", so a bridge does not "
             "have to live in System32.")]
 
+story += [P("8.4 Static font files (optional)", label),
+          P("If Questlog shipped static (non-variable) font files for the weights it uses, Wine would render them correctly "
+            "without the font fix of 4.12.")]
+
 story += [P("9. What is in the package", h1)]
 story += [table([["Path", "What"],
                  [c("install.sh"), "the installer (" + c("--build") + ", " + c("--uninstall") + ", " + c("--help") + ")"],
                  [c("questlog-linux"), "the launcher"],
-                 [c("bin/"), "ready-made " + c("wpcap.dll") + ", " + c("questlog-ctl.exe") + ", " + c("questlog-capture")
+                 [c("bin/"), "ready-made " + c("wpcap.dll") + ", " + c("questlog-ctl.exe") + ", " + c("dwrite.dll") + ", " + c("questlog-capture")
                   + " (built on Fedora 44 from these sources)"],
                  [c("wpcap/wpcap.c"), "the bridge DLL and the window-order guard"],
                  [c("capture/questlog-capture.c"), "the capture service"],
                  [c("ctl/questlog-ctl.c"), "the helper for Questlog's tray icon and window"],
+                 [c("fontfix/dwrite.c"), "the DirectWrite stand-in (font fix)"],
                  [c("tray/questlog-tray.py"), "the tray icon"],
                  [c("systemd/"), "the socket and service units"],
-                 [c("tests/"), "Windows test programs for the guard and the helper"],
+                 [c("tests/"), "Windows test programs for the guard, the helper and the font fix"],
                  [c("Makefile"), c("make") + " builds everything (gcc, libpcap headers, MinGW-w64); " + c("make tests") + " the tests"]],
                 [52 * mm, 118 * mm])]
 story += [P("Tests", h2)]
@@ -407,7 +441,9 @@ story += [code_block("make tests\n"
                      "QL_WINDOW_GUARD=0 wine build/tests/zorder-test.exe build/wpcap.dll build/tests/fake-game.exe\n"
                      "    -> FAIL (shows that the test detects the problem)\n"
                      "wine build/tests/tray-test.exe build/questlog-ctl.exe\n"
-                     "    -> PASS")]
+                     "    -> PASS\n"
+                     "cp build/dwrite.dll build/tests/ && WINEDLLOVERRIDES=dwrite=n,b wine build/tests/fontfix-test.exe\n"
+                     "    -> PASS (and FAIL with WINEDLLOVERRIDES=dwrite=b)")]
 story += [P("The capture service was tested with a client speaking the bridge protocol: the game's ports were captured "
             "(242 packets in 5 s during play), any other port was refused. All tests above passed on the tested system.")]
 

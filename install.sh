@@ -12,7 +12,7 @@
 set -eu
 cd "$(dirname "$(readlink -f "$0")")"
 
-VERSION=1.0.0
+VERSION=1.1.0
 USER_NAME=$(id -un)
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/questlog-linux"
 BIN="$HOME/.local/bin/questlog-linux"
@@ -76,6 +76,9 @@ if [ "$MODE" = uninstall ]; then
     if [ -x "$BIN" ] && pfx=$("$BIN" status 2>/dev/null | sed -n 's/^game prefix:[[:space:]]*//p') && [ -d "$pfx" ]; then
         rm -f "$pfx/drive_c/windows/system32/Npcap/wpcap.dll"
         rmdir "$pfx/drive_c/windows/system32/Npcap" 2>/dev/null || true
+        # the font fix in Questlog's folder (its DllOverrides value alone does nothing without it)
+        f="$pfx/drive_c/Program Files/Questlog/dwrite.dll"
+        [ -f "$f" ] && grep -aqF "variable web fonts use Chromium's FreeType" "$f" && rm -f "$f"
     fi
     systemctl --user stop questlog-linux-tray.service 2>/dev/null || true
     sudo systemctl disable --now questlog-capture.socket 2>/dev/null || true
@@ -104,7 +107,7 @@ need sudo sudo
 # Ready-made programs, or compile them (--build, or when bin/ is missing or does not fit this system).
 SRC=bin
 [ "$MODE" = build ] && SRC=build
-for f in wpcap.dll questlog-ctl.exe questlog-capture; do [ -f "bin/$f" ] || SRC=build; done
+for f in wpcap.dll questlog-ctl.exe dwrite.dll questlog-capture; do [ -f "bin/$f" ] || SRC=build; done
 if [ "$SRC" = bin ] && ldd bin/questlog-capture 2>&1 | grep -q -e 'not found' -e 'version .* not found'; then
     if ldd bin/questlog-capture 2>&1 | grep -q 'GLIBC'; then
         echo "The ready-made capture service needs a newer glibc than this system has; compiling it instead."
@@ -171,6 +174,7 @@ rm -f "$service_tmp"
 put() { install -D -m "$1" "$2" "$3.new" && mv -f "$3.new" "$3"; }
 put 0644 "$SRC/wpcap.dll" "$DATA_DIR/wpcap.dll"
 put 0644 "$SRC/questlog-ctl.exe" "$DATA_DIR/questlog-ctl.exe"
+put 0644 "$SRC/dwrite.dll" "$DATA_DIR/dwrite.dll"
 put 0755 tray/questlog-tray.py "$DATA_DIR/questlog-tray.py"
 put 0755 questlog-linux "$BIN"
 "$BIN" _icon || true   # Questlog's own icon, taken from its installation (once it is installed)

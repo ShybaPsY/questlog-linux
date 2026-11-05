@@ -12,6 +12,7 @@
 #
 # Commands:
 #   questlog-linux show         open the Questlog window (starts it if needed; game must be running)
+#   questlog-linux start        start Questlog in the tray (game must be running)
 #   questlog-linux stop [--now] close Questlog (waits 12 s first while the game runs, so it can save)
 #   questlog-linux status       show what is installed and running
 #   questlog-linux log          show the log
@@ -21,9 +22,10 @@
 #   QL_AUTO_UPDATE=0   do not update Questlog at game start
 #   QL_TRAY=0          keep Questlog's own tray icon instead of ours
 #   QL_WINDOW_GUARD=0  turn off the window-order guard in the capture bridge
+#   QL_FONT_FIX=0      leave Questlog's fonts as Wine's DirectWrite renders them (every weight alike)
 set -u
 
-QL_LINUX_VERSION=1.0.0
+QL_LINUX_VERSION=1.1.0
 APPID="${QL_APPID:-3393110}"
 GAME_EXE="${QL_GAME_EXE:-AION2.exe}"
 STEAM_DIR="${QL_STEAM_DIR:-$HOME/.local/share/Steam}"
@@ -38,6 +40,8 @@ QL_DIR_REL='drive_c/Program Files/Questlog'
 SHIM_REL='drive_c/windows/system32/Npcap/wpcap.dll'
 SHIM_MARK='questlog-linux wpcap bridge'
 CTL="$DATA_DIR/questlog-ctl.exe"
+FONTFIX="$DATA_DIR/dwrite.dll"
+FONTFIX_MARK="variable web fonts use Chromium's FreeType"
 TRAY="$DATA_DIR/questlog-tray.py"
 ICON="$DATA_DIR/questlog.png"
 SAVE_WAIT=12        # Questlog writes fights and settings at most 10 s after they change
@@ -368,6 +372,32 @@ ensure_settings() {
         && log "applied Questlog.exe window settings (Decorated=N, UseTakeFocus=N)"
 }
 
+# Questlog's interface fonts are variable fonts. Wine's DirectWrite ignores their axes, so every
+# weight renders alike (all Encode Sans text Thin). fontfix/dwrite.dll, loaded by Questlog.exe only
+# (per-program DLL override + a copy in its folder), makes Chromium render those fonts with its own
+# FreeType instead, which applies the weights. QL_FONT_FIX=0 takes it out again.
+ensure_fontfix() {
+    local compat="$1" dst key='HKCU\Software\Wine\AppDefaults\Questlog.exe\DllOverrides' have=0
+    dst="$compat/pfx/$QL_DIR_REL/dwrite.dll"
+    awk '/^\[Software\\\\Wine\\\\AppDefaults\\\\Questlog.exe\\\\DllOverrides\]/ {s=1; next} /^\[/ {s=0} s && /^"dwrite"="native,builtin"$/ {f=1} END {exit !f}' \
+        "$compat/pfx/user.reg" 2>/dev/null && have=1
+    if [ "${QL_FONT_FIX:-1}" = 0 ]; then
+        if [ -f "$dst" ] && grep -aqF "$FONTFIX_MARK" "$dst"; then rm -f "$dst" && log "font fix removed (QL_FONT_FIX=0)"; fi
+        [ "$have" = 1 ] && inside "\"\$WINE\" reg delete '$key' /v dwrite /f" >> "$LOG" 2>&1
+        return 0
+    fi
+    [ -f "$FONTFIX" ] || { log "dwrite.dll (font fix) is missing; run install.sh again"; return 0; }
+    if [ -e "$dst" ] && ! grep -aqF "$FONTFIX_MARK" "$dst"; then
+        log "Questlog's folder has a dwrite.dll that is not ours; font fix not applied"
+        return 0
+    fi
+    if ! cmp -s "$FONTFIX" "$dst"; then
+        cp -f "$FONTFIX" "$dst.new" && mv -f "$dst.new" "$dst" && log "installed the font fix (dwrite.dll) in Questlog's folder"
+    fi
+    [ "$have" = 1 ] || { inside "\"\$WINE\" reg add '$key' /v dwrite /t REG_SZ /d native,builtin /f" >> "$LOG" 2>&1 \
+        && log "Questlog.exe now loads the font fix (DllOverrides dwrite=native,builtin)"; }
+}
+
 start_questlog() {
     local compat="$1"; shift
     if [ -n "$(questlog_pids "$compat")" ]; then
@@ -379,6 +409,7 @@ start_questlog() {
     ensure_installed "$compat" || return 1
     update_questlog "$compat"
     ensure_settings "$compat"
+    ensure_fontfix "$compat"
     ensure_icon "$compat"
     log "starting Questlog $*"
     # steam-runtime-launch-client stays attached until Questlog exits, so run it in the background.
@@ -400,7 +431,7 @@ start_tray() {
     fi
     systemctl --user is-active --quiet questlog-linux-tray.service 2>/dev/null && return 0
     local v setenv=()
-    for v in QL_APPID QL_GAME_EXE QL_STEAM_DIR QL_CDN QL_AUTO_UPDATE QL_TRAY QL_WINDOW_GUARD; do
+    for v in QL_APPID QL_GAME_EXE QL_STEAM_DIR QL_CDN QL_AUTO_UPDATE QL_TRAY QL_WINDOW_GUARD QL_FONT_FIX; do
         [ -n "${!v+x}" ] && setenv+=("--setenv=$v=${!v}")
     done
     systemd-run --user --quiet --collect --unit=questlog-linux-tray "${setenv[@]}" \
@@ -491,6 +522,11 @@ status() {
     if service_up; then echo "game container:       reachable"; else echo "game container:       not reachable (start the game with the launch option)"; fi
     if [ -n "${compat:-}" ] && [ -n "$(questlog_pids "$compat")" ]; then echo "Questlog running:     yes"; else echo "Questlog running:     no"; fi
     echo "tray icon:            $(systemctl --user is-active questlog-linux-tray.service 2>/dev/null)"
+    if [ -n "${compat:-}" ] && grep -aqsF "$FONTFIX_MARK" "$compat/pfx/$QL_DIR_REL/dwrite.dll"; then
+        echo "font fix:             installed$( [ "${QL_FONT_FIX:-1}" = 0 ] && echo ' (removed on the next start: QL_FONT_FIX=0)')"
+    else
+        echo "font fix:             not installed yet (applied on the next start)"
+    fi
 }
 
 case "${1:-}" in
@@ -509,7 +545,7 @@ case "${1:-}" in
             [ ! -t 2 ] && notify "$msg"
             die "$msg"
         fi
-        start_questlog "$compat" || exit 1
+        if [ "$1" = show ]; then start_questlog "$compat" || exit 1; else start_questlog "$compat" --hidden || exit 1; fi
         start_tray "$compat"
         [ "$1" = show ] && activate_window "$compat" ;;
     stop)
@@ -523,7 +559,7 @@ case "${1:-}" in
     --version|version)
         echo "questlog-linux $QL_LINUX_VERSION" ;;
     ""|-h|--help|help)
-        sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+        sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
         # Steam launch option mode: everything after us is the game's command line.
         export STEAM_COMPAT_LAUNCHER_SERVICE=proton
