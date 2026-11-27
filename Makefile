@@ -2,7 +2,7 @@ MINGW_CC ?= x86_64-w64-mingw32-gcc
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu17
 
-all: build/wpcap.dll build/questlog-ctl.exe build/dwrite.dll build/questlog-capture
+all: build/wpcap.dll build/questlog-ctl.exe build/dwrite.dll build/questlog-capture build/noshape.so
 
 build/wpcap.dll: wpcap/wpcap.c
 	@mkdir -p build
@@ -19,6 +19,10 @@ build/dwrite.dll: fontfix/dwrite.c
 build/questlog-capture: capture/questlog-capture.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o $@ $< -lpcap
+
+build/noshape.so: noshape/noshape.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -shared -fPIC -s -o $@ $< -ldl
 
 # Windows test programs: run them under Wine in a throwaway prefix (never the game prefix); each prints PASS or FAIL
 tests: build/tests/zorder-test.exe build/tests/fake-game.exe build/tests/tray-test.exe build/tests/fontfix-test.exe

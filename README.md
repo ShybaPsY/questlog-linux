@@ -24,7 +24,7 @@ Made with the Questlog team's knowledge. Not an official Questlog product, and i
 
 **Needs:** Steam as a normal package (not Flatpak), systemd, sudo, curl, openssl, python3 and libpcap. The ready-made programs need glibc 2.34 or newer. Optional: PySide6 (tray icon), 7-Zip (update check), xdotool, notify-send.
 
-**Tested on:** Fedora 44, KDE Plasma 6.7 (Wayland), Proton 11, Questlog 0.1.48. Other distributions and desktops are untested.
+**Tested on:** Fedora 44, KDE Plasma 6.7 (Wayland), Proton 11, Questlog 0.1.48; Arch Linux (Omarchy), Hyprland 0.56 (Wayland), NVIDIA, Proton Experimental (11), Questlog 0.1.56. Other distributions and desktops are untested.
 
 ## Use
 
@@ -41,6 +41,7 @@ Made with the Questlog team's knowledge. Not an official Questlog product, and i
 - Npcap cannot run under Wine. A stand-in `wpcap.dll` implements the libpcap calls Questlog makes and forwards them to `questlog-capture`, a small Linux service that captures only the game's own TCP connections.
 - The launcher runs Questlog inside the game's Wine session through Steam's launcher service, so Questlog sees the game process, its connections and its window as on Windows.
 - It also works around what comes with sharing a Wine session with a fullscreen game: window focus, the overlay layer under KDE, the tray menu, clicks reaching Questlog, updates and quitting.
+- Under Hyprland, Wine's X shapes on Questlog's transparent overlay widgets show up as black boxes around every widget. A small `noshape.so`, preloaded into Questlog only (never the game), drops those shapes; click-through is unchanged. It is on automatically under Hyprland; `QL_SHAPE_FIX=1` or `0` in the launch option forces it on or off.
 - Questlog's interface fonts are variable fonts, and Wine's DirectWrite ignores their weights (every weight rendered alike, Encode Sans all Thin). A small `dwrite.dll` stand-in, loaded by Questlog only, makes Chromium render them with its own FreeType, at the right weights.
 
 [Questlog-on-Linux.pdf](Questlog-on-Linux.pdf) explains each part, every problem found under Wine/Proton and why each fix was chosen, plus security, measurements and known limits.
