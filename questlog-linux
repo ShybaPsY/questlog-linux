@@ -23,6 +23,7 @@
 #   QL_TRAY=0          keep Questlog's own tray icon instead of ours
 #   QL_WINDOW_GUARD=0  turn off the window-order guard in the capture bridge
 #   QL_FONT_FIX=0      leave Questlog's fonts as Wine's DirectWrite renders them (every weight alike)
+#   QL_SHAPE_FIX=1|0   force the overlay black-box fix on or off (default: on under Hyprland only)
 set -u
 
 QL_LINUX_VERSION=1.1.0
@@ -42,6 +43,7 @@ SHIM_MARK='questlog-linux wpcap bridge'
 CTL="$DATA_DIR/questlog-ctl.exe"
 FONTFIX="$DATA_DIR/dwrite.dll"
 FONTFIX_MARK="variable web fonts use Chromium's FreeType"
+NOSHAPE="$DATA_DIR/noshape.so"
 TRAY="$DATA_DIR/questlog-tray.py"
 ICON="$DATA_DIR/questlog.png"
 SAVE_WAIT=12        # Questlog writes fights and settings at most 10 s after they change
@@ -398,6 +400,23 @@ ensure_fontfix() {
         && log "Questlog.exe now loads the font fix (DllOverrides dwrite=native,builtin)"; }
 }
 
+# Black boxes around the overlay widgets (Hyprland): Wine clips Questlog's transparent layered
+# windows with X bounding shapes, and under Hyprland's XWayland everything outside such a shape
+# is drawn opaque black. noshape.so (noshape/noshape.c), preloaded into Questlog only, drops the
+# bounding shapes; the pixels there are fully transparent anyway, and input shapes (click-through)
+# are left alone. Wine's ShapeLayeredWindows=N does not stop these shapes. KWin shows them
+# correctly, so it is on by default only under Hyprland; QL_SHAPE_FIX=1 or 0 forces it.
+shape_fix_on() {
+    [ -f "$NOSHAPE" ] || return 1
+    case "${QL_SHAPE_FIX:-auto}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && return 0
+    case ":${XDG_CURRENT_DESKTOP:-}:" in *:Hyprland:*) return 0 ;; esac
+    return 1
+}
+
 start_questlog() {
     local compat="$1"; shift
     if [ -n "$(questlog_pids "$compat")" ]; then
@@ -411,11 +430,18 @@ start_questlog() {
     ensure_settings "$compat"
     ensure_fontfix "$compat"
     ensure_icon "$compat"
-    log "starting Questlog $*"
+    local preload=""
+    if shape_fix_on; then
+        # inside the container, in front of whatever Steam preloads there (its overlay)
+        preload="LD_PRELOAD='$NOSHAPE'\${LD_PRELOAD:+:\$LD_PRELOAD} "
+        log "starting Questlog $* (overlay shape fix on)"
+    else
+        log "starting Questlog $*"
+    fi
     # steam-runtime-launch-client stays attached until Questlog exits, so run it in the background.
     # Chromium under Wine prints a harmless network-notifier error every second; keep it out.
     # fd 8 (the watcher's lock) is not passed on.
-    nohup "$SELF" _inside "\"\$WINE\" '$QL_EXE' $*" < /dev/null 8>&- 2>&1 \
+    nohup "$SELF" _inside "$preload\"\$WINE\" '$QL_EXE' $*" < /dev/null 8>&- 2>&1 \
         | grep --line-buffered -v -e 'network_change_notifier_win' -e '^info:' -e '^warn:' > "$STATE_DIR/questlog-app.log" 8>&- &
 }
 
@@ -431,7 +457,7 @@ start_tray() {
     fi
     systemctl --user is-active --quiet questlog-linux-tray.service 2>/dev/null && return 0
     local v setenv=()
-    for v in QL_APPID QL_GAME_EXE QL_STEAM_DIR QL_CDN QL_AUTO_UPDATE QL_TRAY QL_WINDOW_GUARD QL_FONT_FIX; do
+    for v in QL_APPID QL_GAME_EXE QL_STEAM_DIR QL_CDN QL_AUTO_UPDATE QL_TRAY QL_WINDOW_GUARD QL_FONT_FIX QL_SHAPE_FIX; do
         [ -n "${!v+x}" ] && setenv+=("--setenv=$v=${!v}")
     done
     systemd-run --user --quiet --collect --unit=questlog-linux-tray "${setenv[@]}" \
@@ -527,6 +553,13 @@ status() {
     else
         echo "font fix:             not installed yet (applied on the next start)"
     fi
+    if shape_fix_on; then
+        echo "overlay shape fix:    on (applied when Questlog starts)"
+    elif [ -f "$NOSHAPE" ]; then
+        echo "overlay shape fix:    off (only needed under Hyprland; QL_SHAPE_FIX=1 forces it)"
+    else
+        echo "overlay shape fix:    not installed"
+    fi
 }
 
 case "${1:-}" in
@@ -559,7 +592,7 @@ case "${1:-}" in
     --version|version)
         echo "questlog-linux $QL_LINUX_VERSION" ;;
     ""|-h|--help|help)
-        sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+        sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
         # Steam launch option mode: everything after us is the game's command line.
         export STEAM_COMPAT_LAUNCHER_SERVICE=proton
